@@ -49,7 +49,7 @@ then run `/reload-plugins` in an open session, or start a new one.
 
 ## Use
 
-Type as usual. A moment after you pause, the row appears above the input. Keep typing and it dims with "updating after you pause…" until a fresh version arrives, so you never accept one made for an older draft.
+Type as usual. When you pause, a spinning "⠋ Polishing…" appears above the input, and the suggestion takes its place about two seconds later. Keep typing and an earlier suggestion dims with "updating after you pause…", then shows the spinner once you pause again, so you never accept one made for an older draft. If the draft needs no changes, the spinner just goes away.
 
 - **Accept:** click it. In the terminal you can also press `ctrl+x` then `tab` to move into the row, then `a`.
 - **Dismiss:** click it, or `x` once the row has the focus.
@@ -61,7 +61,7 @@ Type as usual. A moment after you pause, the row appears above the input. Keep t
 | `/polish optimize` | The default. Fixes the wording, makes the ask clear and ordered, and uses the recent conversation for context. |
 | `/polish fix` | Fixes spelling, grammar and word choice only, and keeps your length and tone. |
 | `/polish off`, `/polish on` | Turns the mod off or on. `/polish` alone toggles it. |
-| `/polish stats` | Shows how long the model calls take and how many drafts were answered from memory. |
+| `/polish stats` | Shows how long the model calls take, how many drafts were answered from memory and how many slow calls were backed up. |
 
 The mode and the on/off switch are remembered across sessions. Both modes write English and translate any Chinese.
 
@@ -79,6 +79,7 @@ Over Remote Control from a phone there is no live preview, so the mod polishes t
 
 - Your draft goes to Claude Haiku through your Claude Code account, the same way Claude Code's own requests do. In optimize mode, so do up to the last 4 messages of the conversation (at most 3,000 characters). Nothing goes anywhere else.
 - Each pause in typing costs one small Haiku call. Answers are remembered for the current turn, so a trailing space, a backspace or an undo back to an earlier draft costs nothing.
+- A call takes about two seconds however short the draft, and an occasional one takes five or more. A call still unanswered after 2.5 seconds is sent a second time and the first answer is used, so a slow call costs one extra small request.
 
 ## Run it from a folder
 

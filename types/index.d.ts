@@ -18,6 +18,8 @@ declare module 'claude-code' {
   interface PluginState {
     'prompt-polish': {
       preview: Shaped<Preview | null>
+      // The trimmed draft a polish is running for since the person paused.
+      loading: Shaped<string | null>
     }
   }
 }

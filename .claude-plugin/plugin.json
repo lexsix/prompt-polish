@@ -1,6 +1,6 @@
 {
   "name": "prompt-polish",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Polishes your prompt as you type: fixes the grammar, sharpens what you mean and translates Chinese into English, shown as a diff above the input to accept or dismiss",
   "author": { "name": "lexsix" },
   "homepage": "https://github.com/lexsix/prompt-polish",

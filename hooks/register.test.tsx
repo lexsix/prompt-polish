@@ -70,6 +70,63 @@ const engine = (on: On, surfaces: RenderSurface[]) => {
   return { asked, sent, reads }
 }
 
+test('a slow call gets a twin after 2.5 seconds, and the first answer wins', async ($, on) => {
+  const clock = mock.clock(on)
+  const sent: string[] = []
+  let calls = 0
+
+  mock.store(on)
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('command.register', () => ({ value: { command: 'polish' } }))
+  on('session.surfaces', () => ({ value: ['mobile'] }))
+  on('session.messages', () => ({ value: [] }))
+  on('model.complete', async () => {
+    calls += 1
+
+    // The first call is one of the slow outliers.
+    if (calls === 1) {
+      await clock.sleep(10_000)
+    }
+
+    return {
+      value: {
+        isAnswered: true,
+        text: `<polished>${POLISHED}</polished>`,
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      },
+    }
+  })
+  on('prompt.submit', (_, e) => {
+    sent.push(e.text)
+
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/', surface: null, isInteractive: false })
+
+  const submitted = $.prompt.submit({ text: DRAFT, wait: false, origin: { kind: 'sdk' } })
+  await clock.advance(0)
+  expect(calls).toBe(1)
+  await clock.advance(2_500)
+  await submitted
+
+  expect(calls).toBe(2)
+  expect(sent).toEqual([POLISHED])
+  await clock.advance(10_000)
+
+  const stats = await $.command.run({
+    command: 'polish',
+    args: 'stats',
+    origin: { kind: 'sdk' },
+    presentation: PRESENTATION,
+  })
+  expect(stats).toMatchObject({ text: expect.stringContaining('1 slow call backed up') })
+})
+
 test('a draft polished once is answered from memory, and the conversation read once', async ($, on) => {
   const { asked, sent, reads } = engine(on, ['mobile'])
   await $.session.start({ cwd: '/', surface: null, isInteractive: false })
@@ -251,4 +308,58 @@ test('the English inside a mixed draft lines up with its translation', () => {
   expect(runs.filter(run => run.kind === 'same').map(run => run.text).join('')).toContain(
     'warning log.',
   )
+})
+
+// Stands in for what an earlier hook of the mod stored, in the atoms' shape.
+const seed = (on: On, stored: Record<string, { shape: string; value: unknown }>) => {
+  on('state.get', (_, e, next) => {
+    const value = e.plugin === 'prompt-polish' ? stored[String(e.key)] : undefined
+
+    return value === undefined ? next(e) : { value: { value, version: 1 } }
+  })
+}
+
+test('after a pause the band shows a turning spinner until the answer comes', async ($, on) => {
+  seed(on, { loading: { shape: 'loading-1', value: DRAFT } })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount(band(surface))
+    const first = await ui.find({ type: 'Text', in: 'polishing', text: /Polishing…/ })
+    await ui.advance(80)
+    const next = await ui.find({ type: 'Text', in: 'polishing', text: /Polishing…/ })
+
+    expect(first?.text).toBe('⠋ Polishing…')
+    expect(next?.text).toBe('⠙ Polishing…')
+    await ui.unmount()
+  }
+})
+
+test('without a Client the band says Polishing… plainly', async ($, on) => {
+  seed(on, { loading: { shape: 'loading-1', value: DRAFT } })
+
+  const ui = await $.ui.mount(band('mobile'))
+  expect((await ui.find({ type: 'Text', text: /Polishing…/ }))?.text).toBe('Polishing…')
+  await ui.unmount()
+})
+
+test('over an older suggestion the spinner takes the place of "updating"', async ($, on) => {
+  seed(on, {
+    loading: { shape: 'loading-1', value: `${DRAFT} more` },
+    preview: {
+      shape: 'preview-2',
+      value: {
+        mode: 'fix',
+        draft: DRAFT,
+        polished: POLISHED,
+        segments: wordDiff(DRAFT, POLISHED),
+        isStale: true,
+      },
+    },
+  })
+
+  const ui = await $.ui.mount(band('terminal'))
+  expect((await ui.find({ type: 'Text', in: 'polishing', text: /Polishing…/ }))?.text).toBe('⠋ Polishing…')
+  expect(await ui.find({ type: 'Text', text: /updating after you pause/ })).toBe(undefined)
+  expect(await ui.find({ key: 'accept' })).toBe(undefined)
+  await ui.unmount()
 })

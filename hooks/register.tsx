@@ -1,5 +1,11 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, Timer } from 'claude-code'
+import type {
+  EngineInterface,
+  ModelCompleteRequest,
+  ModelCompleteResult,
+  Register,
+  Timer,
+} from 'claude-code'
 
 import type { Mode, Segment } from '../types'
 import {
@@ -16,11 +22,19 @@ import {
 const preview = atom({ plugin: 'prompt-polish', key: 'preview' } as const, null, {
   shape: 'preview-2',
 })
+const loading = atom({ plugin: 'prompt-polish', key: 'loading' } as const, null, {
+  shape: 'loading-1',
+})
 
 // How long typing must pause before the draft goes off: short once a word
 // is finished, longer mid-word, where the person is more likely still typing.
-const PAUSE_AFTER_WORD_MS = 350
-const PAUSE_MID_WORD_MS = 700
+// Each call costs about two seconds whatever its size, so starting it sooner
+// is worth more than a request or two the person types past.
+const PAUSE_AFTER_WORD_MS = 200
+const PAUSE_MID_WORD_MS = 500
+// A call still unanswered after this gets a twin, and the first answer wins:
+// calls do not queue, and the slow ones are outliers of five seconds and more.
+const HEDGE_MS = 2_500
 // Enter waits on the polish where there is no live band, so it gets less time.
 const LIVE_TIMEOUT_MS = 12_000
 const SUBMIT_TIMEOUT_MS = 8_000
@@ -51,6 +65,34 @@ const memo = new Map<string, string | null>()
 const pending = new Map<string, Promise<string | null>>()
 const timings: number[] = []
 let memoHits = 0
+let hedges = 0
+// What the mod saw and what last went wrong, for `/polish stats`.
+let editsSeen = 0
+let polishesStarted = 0
+let suggestionsShown = 0
+let lastProblem: string | undefined
+// Surfaces where the spinner's Client failed: they get the plain text instead.
+const spinnerFailedOn = new Set<string>()
+
+// The spinner's value never stops a polish: a refused read or write is noted
+// for `/polish stats`, and the polish goes on without the spinner.
+async function setLoading($: EngineInterface, next: (now: string | null) => string | null) {
+  try {
+    await update($, loading, next)
+  } catch (error) {
+    lastProblem = `spinner state: ${String(error)}`
+  }
+}
+
+async function readLoading($: EngineInterface): Promise<string | null> {
+  try {
+    return await read($, loading)
+  } catch (error) {
+    lastProblem = `spinner state: ${String(error)}`
+
+    return null
+  }
+}
 
 function memoKey(text: string): string {
   return `${mode}\n${text.trim()}`
@@ -73,6 +115,43 @@ function recentContext($: EngineInterface): Promise<string> {
   return context
 }
 
+// One model call, backed up by a twin once it has run HEDGE_MS; the first
+// answer wins and the other call is cut.
+async function hedgedComplete(
+  $: EngineInterface,
+  request: ModelCompleteRequest,
+  signal: AbortSignal,
+): Promise<ModelCompleteResult> {
+  const first = new AbortController()
+  const second = new AbortController()
+  const stopBoth = () => {
+    first.abort()
+    second.abort()
+  }
+
+  if (signal.aborted) {
+    stopBoth()
+  }
+
+  signal.addEventListener('abort', stopBoth, { once: true })
+
+  let backup: Timer | undefined
+  const twin = new Promise<ModelCompleteResult>(resolve => {
+    backup = $.clock.after(HEDGE_MS, () => {
+      hedges += 1
+      void $.model.complete(request, { signal: second.signal }).then(resolve, () => undefined)
+    })
+  })
+
+  try {
+    return await Promise.race([$.model.complete(request, { signal: first.signal }), twin])
+  } finally {
+    backup?.cancel()
+    stopBoth()
+    signal.removeEventListener('abort', stopBoth)
+  }
+}
+
 async function complete(
   $: EngineInterface,
   text: string,
@@ -84,11 +163,13 @@ async function complete(
     const as = mode
     const known = as === 'optimize' ? await recentContext($) : ''
     const startedAt = await $.clock.now()
-    const reply = await $.model.complete(polishRequest(text, as, known, timeoutMs), { signal })
+    const reply = await hedgedComplete($, polishRequest(text, as, known, timeoutMs), signal)
     timings.push((await $.clock.now()) - startedAt)
     timings.splice(0, Math.max(0, timings.length - TIMINGS_KEPT))
 
     if (!reply.isAnswered) {
+      lastProblem = `model call: ${reply.reason}${'error' in reply ? ` (${reply.error})` : ''}`
+
       return null
     }
 
@@ -96,7 +177,9 @@ async function complete(
     remember(key, polished)
 
     return polished
-  } catch {
+  } catch (error) {
+    lastProblem = `model call: ${String(error)}`
+
     return null
   }
 }
@@ -135,15 +218,26 @@ function stopPolishing() {
 }
 
 async function polishDraft($: EngineInterface, text: string) {
-  const polished = await polish($, text, LIVE_TIMEOUT_MS, stopAll.signal)
+  const key = text.trim()
 
-  if (!isEnabled || text.trim() !== draft) {
+  // The person stopped typing and the answer is not known yet: show it is on its way.
+  if (!memo.has(memoKey(text))) {
+    polishesStarted += 1
+    await setLoading($, now => (key === draft ? key : now))
+  }
+
+  const polished = await polish($, text, LIVE_TIMEOUT_MS, stopAll.signal)
+  await setLoading($, now => (now === key ? null : now))
+
+  if (!isEnabled || key !== draft) {
     return
   }
 
+  suggestionsShown += polished === null ? 0 : 1
+
   // Checked again as it writes: the draft may have been sent or changed meanwhile.
   await update($, preview, now => {
-    if (text.trim() !== draft) {
+    if (key !== draft) {
       return now
     }
 
@@ -158,6 +252,7 @@ async function forgetDraft($: EngineInterface) {
   draft = ''
   timer?.cancel()
   await update($, preview, () => null)
+  await setLoading($, () => null)
 }
 
 async function onDraft($: EngineInterface, text: string) {
@@ -171,6 +266,11 @@ async function onDraft($: EngineInterface, text: string) {
   draft = key
   timer?.cancel()
   const shown = await read($, preview)
+
+  // Typing again: whatever was loading was for an older draft.
+  if ((await readLoading($)) !== null) {
+    await setLoading($, () => null)
+  }
 
   if (!isEnabled || !worthPolishing(text) || key === shown?.polished) {
     if (shown) {
@@ -192,7 +292,7 @@ async function onDraft($: EngineInterface, text: string) {
   }
 
   const pause = endsAWord(text) ? PAUSE_AFTER_WORD_MS : PAUSE_MID_WORD_MS
-  timer = $.clock.after(pause, () => void polishDraft($, text))
+  timer = $.clock.after(pause, () => void polishDraft($, text).catch(noteProblem('polish')))
 }
 
 // Accept: the polished prompt goes in the box, for the person's own Enter.
@@ -208,18 +308,30 @@ async function acceptPreview($: EngineInterface) {
   await $.prompt.fill({ text: now.polished, mode: 'replace' })
 }
 
+// Records what stopped a step, where no one else would hear of it.
+function noteProblem(where: string) {
+  return (error: unknown) => {
+    lastProblem = `${where}: ${String(error)}`
+  }
+}
+
 function stats(): string {
   const fromMemory = `${memoHits} ${memoHits === 1 ? 'draft' : 'drafts'} answered from memory`
+  const backedUp = `${hedges} slow ${hedges === 1 ? 'call' : 'calls'} backed up`
+  const status = `Prompt polish is ${isEnabled ? `on, ${mode} mode` : 'off'}.`
+  const activity = `Since it loaded: ${editsSeen} edits seen, ${polishesStarted} polishes started, ${suggestionsShown} suggestions shown.`
+  const problem = lastProblem ? `Last problem: ${lastProblem}` : 'No problems so far.'
 
   if (timings.length === 0) {
-    return `No model calls yet; ${fromMemory}.`
+    return [status, activity, `No model calls yet; ${fromMemory}.`, problem].join('\n')
   }
 
   const sorted = [...timings].sort((a, b) => a - b)
   const median = sorted[Math.floor(sorted.length / 2)] ?? 0
   const last = timings[timings.length - 1] ?? 0
+  const calls = `Model calls: median ${Math.round(median)} ms, last ${Math.round(last)} ms (of the last ${timings.length}); ${fromMemory}; ${backedUp}.`
 
-  return `Model calls: median ${Math.round(median)} ms, last ${Math.round(last)} ms (of the last ${timings.length}); ${fromMemory}.`
+  return [status, activity, calls, problem].join('\n')
 }
 
 export const register: Register = on => {
@@ -254,8 +366,7 @@ export const register: Register = on => {
     await $.store.set('isEnabled', isEnabled)
     await $.store.set('mode', mode)
     stopPolishing()
-    draft = ''
-    await update($, preview, () => null)
+    await forgetDraft($)
 
     if (!isEnabled) {
       return { text: 'Prompt polish is off.' }
@@ -280,10 +391,23 @@ export const register: Register = on => {
   // The person types; the band above the prompt follows.
   on('prompt.edit', async ($, e, next) => {
     hasLiveDrafts = true
+    editsSeen += 1
     const box = await next(e)
-    void onDraft($, box.text).catch(() => undefined)
+    void onDraft($, box.text).catch(noteProblem('typing'))
 
     return box
+  })
+
+  // The spinner failed where it was drawn: that surface gets plain text, and
+  // the engine draws the band again on its own.
+  on('ui.fault', ($, e, next) => {
+    if (e.module.endsWith('spinner.ts')) {
+      spinnerFailedOn.add(e.surface)
+    }
+
+    lastProblem = `spinner on ${e.surface} (${e.phase}): ${e.reason}`
+
+    return next(e)
   })
 
   // A history recall, a clear, a submit or a fill: no keystroke carried it.
@@ -338,12 +462,29 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const shown = await read($, preview)
+    const pending = await readLoading($)
 
-    if (e.props.hasSurvey || !shown) {
+    if (e.props.hasSurvey || (!shown && pending === null)) {
       return next(e)
     }
 
-    const { Box, Button, Text } = $.ui.resolve(e)
+    const elements = $.ui.resolve(e)
+    const { Box, Button, Text } = elements
+    // Animated where the surface runs a Client: the terminal and the desktop
+    // app. The table lists one on other surfaces too, which refuse it, and a
+    // surface where it failed once gets the plain text from then on.
+    const runsClient =
+      (e.surface === 'terminal' || e.surface === 'desktop') && !spinnerFailedOn.has(e.surface)
+    const polishing =
+      runsClient && 'Client' in elements ? (
+        <elements.Client key="polishing" module="./spinner.ts" props="Polishing…" />
+      ) : (
+        <Text dimColor>Polishing…</Text>
+      )
+
+    if (!shown) {
+      return <Box>{polishing}</Box>
+    }
 
     // Removed words struck through in red, added ones bold in green.
     const changes = (segments: Segment[]) => {
@@ -385,7 +526,7 @@ export const register: Register = on => {
         </Text>
         <Box flexDirection="row" gap={1}>
           {shown.isStale ? (
-            <Text dimColor>updating after you pause…</Text>
+            pending !== null ? polishing : <Text dimColor>updating after you pause…</Text>
           ) : (
             <Button
               key="accept"
