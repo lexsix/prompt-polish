@@ -9,7 +9,7 @@ A Claude Code mod that polishes your prompt while you type it. When you pause, i
 The result appears in a row just above the input, as a diff and as clean text:
 
 ```
-Optimized: Check why the config loader ~~crash~~ crashes when the file is missing, ~~并且~~ and add a warning log.
+Polished: Check why the config loader ~~crash~~ crashes when the file is missing, ~~并且~~ and add a warning log.
 → Check why the config loader crashes when the file is missing, and add a warning log.
 [Accept] [Dismiss]
 ```

@@ -45,7 +45,6 @@ const TIMINGS_KEPT = 20
 const TYPED_ORIGINS = new Set(['sdk', 'bridge'])
 // Every way a person sends what is in their box, the terminal's Enter included.
 const SENT_BY_PERSON = new Set(['composer', 'sdk', 'bridge'])
-const LABELS: Record<Mode, string> = { fix: 'Polished', optimize: 'Optimized' }
 
 // Module state: a reload starts it over, and `session.start` reads the settings.
 let isEnabled = true
@@ -516,7 +515,7 @@ export const register: Register = on => {
       <Box flexDirection="column">
         <Text wrap="wrap" dimColor={shown.isStale}>
           <Text color="suggestion" bold>
-            {LABELS[shown.mode]}:{' '}
+            Polished:{' '}
           </Text>
           {changes(shown.segments)}
         </Text>
