@@ -1,0 +1,6 @@
+{
+  "name": "prompt-polish",
+  "owner": { "name": "lexsix" },
+  "description": "prompt-polish: polishes your Claude Code prompts as you type",
+  "plugins": [{ "name": "prompt-polish", "source": "./" }]
+}
